@@ -1,0 +1,354 @@
+import os
+import asyncio
+import tempfile
+import uvicorn
+import logging
+import time
+from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import PlainTextResponse
+from faster_whisper import WhisperModel
+from deep_translator import GoogleTranslator
+import requests
+
+# from opentelemetry import trace
+# from opentelemetry.sdk.resources import Resource
+# from opentelemetry.sdk.trace import TracerProvider
+# from opentelemetry.sdk.trace.export import BatchSpanProcessor
+# from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+# from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+# from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- OPENTELEMETRY SETUP (DISABLED) ---
+# OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+# SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "whisper-server")
+
+# resource = Resource.create({
+#     "service.name": SERVICE_NAME,
+# })
+
+# tracer_provider = TracerProvider(resource=resource)
+# otlp_exporter = OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True)
+# span_processor = BatchSpanProcessor(otlp_exporter)
+# tracer_provider.add_span_processor(span_processor)
+# trace.set_tracer_provider(tracer_provider)
+# tracer = trace.get_tracer(__name__)
+
+# RequestsInstrumentor().instrument()
+
+app = FastAPI(title="Harden Whisper STT Service")
+# FastAPIInstrumentor.instrument_app(app)
+
+# --- CONFIGURATION (ENV DRIVEN) ---
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_MAX_JOBS = int(os.getenv("WHISPER_MAX_JOBS", "1"))
+TRANSLATE_TIMEOUT = float(os.getenv("TRANSLATE_TIMEOUT", "10.0"))
+TRANSLATE_PROVIDER = os.getenv("TRANSLATE_PROVIDER", "google").lower() # google | libre | off
+LIBRE_TRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://localhost:5000/translate")
+
+# --- INITIAL PROMPT FOR BETTER CONTEXT ---
+# This helps the model stay in the right language and style (Chinese Drama aka Dracin)
+DRACIN_PROMPT = "Mandarin Chinese (simplified) drama dialogue. Casual, colloquial. 电视剧普通话对白，日常口语。"
+
+# --- SINGLETON MODEL & CONCURRENCY CONTROL ---
+logger.info(f"Loading Whisper model '{WHISPER_MODEL_NAME}' on {WHISPER_DEVICE}...")
+model = WhisperModel(WHISPER_MODEL_NAME, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
+
+whisper_semaphore = asyncio.Semaphore(WHISPER_MAX_JOBS)
+
+class TranslationManager:
+    @staticmethod
+    def _sync_translate(text: str, target_lang: str, source_lang: str = "auto") -> str:
+        """Blocking translation call to be run in a thread."""
+        # Normalize source_lang for Google (zh -> zh-CN)
+        s_lang = source_lang
+        if TRANSLATE_PROVIDER == "google" and s_lang == "zh": s_lang = "zh-CN"
+
+        # Bersihkan teks Mandarin dari simbol aneh sebelum dikirim
+        text = text.strip()
+        
+        # Simple retry logic (up to 2 times)
+        for attempt in range(3):
+            try:
+                if TRANSLATE_PROVIDER == "google":
+                    return GoogleTranslator(source=s_lang, target=target_lang).translate(text)
+                elif TRANSLATE_PROVIDER == "libre":
+                    resp = requests.post(
+                        LIBRE_TRANSLATE_URL,
+                        json={"q": text, "source": s_lang, "target": target_lang, "format": "text"},
+                        timeout=TRANSLATE_TIMEOUT
+                    )
+                    if resp.status_code == 200:
+                        return resp.json().get("translatedText", text)
+            except Exception as e:
+                logger.warning(f"Translation attempt {attempt+1} failed: {e}")
+                if attempt == 1: raise e
+                time.sleep(0.5)
+        return text
+
+    @classmethod
+    async def translate_async(cls, text: str, target_lang: str, source_lang: str = "auto") -> str:
+        """Non-blocking translation with hard timeout and thread offloading."""
+        if TRANSLATE_PROVIDER == "off" or not text.strip():
+            return text
+        
+        try:
+            logger.info(f"Translating {source_lang} -> {target_lang}: {text[:30]}...")
+            translated = await asyncio.wait_for(
+                asyncio.to_thread(cls._sync_translate, text, target_lang, source_lang),
+                timeout=TRANSLATE_TIMEOUT
+            )
+            return translated
+        except asyncio.TimeoutError:
+            logger.error(f"Translation timed out after {TRANSLATE_TIMEOUT}s for text: {text[:30]}...")
+        except Exception as e:
+            logger.error(f"Translation failed ({TRANSLATE_PROVIDER}): {e}")
+        
+        return text # Fallback to original text
+
+def is_valid_segment(s) -> bool:
+    text = s.text.strip()
+    if not text: 
+        return False
+    
+    # Lenient check for single-character languages (Chinese, etc)
+    if len(text) < 1: 
+        return False
+    
+    # Relaxed thresholds for better sensitivity
+    if s.no_speech_prob > 0.95: # Very lenient (was 0.8)
+        return False 
+    if s.avg_logprob < -1.5:  # Very lenient (was -1.2)
+        return False
+    if (s.end - s.start) < 0.2: # More lenient (was 0.3)
+        return False
+    return True
+
+def format_timestamp(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    msecs = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02}:{minutes:02}:{secs:02}.{msecs:03}"
+
+
+
+def regroup_by_words(segments, max_chars=40, max_dur=2.5, max_gap=0.6):
+    """
+    Reconstruct segments from word timestamps to effectively 'split' long lines 
+    and 'merge' short ones naturally based on pauses and punctuation.
+    """
+    new_segments = []
+    current_words = []
+    current_len = 0
+    current_start = 0.0
+    last_end = 0.0
+    
+    # Flatten all words from VALID segments
+    all_words = []
+    for s in segments:
+        if hasattr(s, 'words') and s.words:
+            all_words.extend(s.words)
+    
+    if not all_words:
+        # Fallback if no word info available
+        for s in segments:
+            new_segments.append({
+                "start": s.start,
+                "end": s.end,
+                "text": s.text.strip()
+            })
+        return new_segments
+
+    for w in all_words:
+        # initialize start of new segment
+        if not current_words:
+            current_start = w.start
+        
+        # Check for meaningful gap (silence)
+        is_gap = (w.start - last_end) > max_gap if last_end > 0 else False
+        
+        # Check length / duration
+        # Note: w.word usually includes leading space for latin languages
+        w_len = len(w.word)
+        is_long = (current_len + w_len) > max_chars
+        is_toolong_dur = (w.end - current_start) > max_dur
+        
+        # Check punctuation (Sentence endings)
+        text_so_far = "".join(current_words).strip()
+        has_punctuation = text_so_far and text_so_far[-1] in ['.', '?', '!', '。', '？', '！']
+        
+        # DECIDE TO SPLIT
+        if current_words and (is_gap or is_long or is_toolong_dur or has_punctuation):
+            new_segments.append({
+                "start": current_start,
+                "end": last_end,
+                "text": text_so_far
+            })
+            current_words = []
+            current_len = 0
+            current_start = w.start
+        
+        current_words.append(w.word)
+        current_len += w_len
+        last_end = w.end
+
+    # Flush last chunk
+    if current_words:
+        new_segments.append({
+            "start": current_start,
+            "end": last_end,
+            "text": "".join(current_words).strip()
+        })
+        
+    return new_segments
+
+async def process_and_translate_segments(segments, target_lang: str, needs_translation: bool, source_lang: str = "auto"):
+    logger.info(f"Processing raw segments... Needs translate: {needs_translation}")
+    
+    # 1. Filter valid segments FIRST
+    valid_raw_segments = []
+    for i, s in enumerate(segments):
+        if is_valid_segment(s):
+            valid_raw_segments.append(s)
+        else:
+            logger.debug(f"Segment {i} filtered.")
+    
+    if not valid_raw_segments:
+        logger.warning("No valid segments found.")
+        return []
+
+    # 2. Regroup based on Words (Natural Flow)
+    # Modified parameters for better readability:
+    # max_gap=1.0: Don't split on short pauses (<1s), keeps phrases together.
+    # max_chars=42: Slightly more text allowed.
+    processed_data = regroup_by_words(valid_raw_segments, max_chars=42, max_dur=3.5, max_gap=1.0)
+    logger.info(f"Regrouped into {len(processed_data)} natural segments.")
+
+    # 3. Translate the NEW segments
+    if needs_translation:
+        logger.info(f"Translating {len(processed_data)} segments...")
+        for i, item in enumerate(processed_data):
+            translated = await TranslationManager.translate_async(item["text"], target_lang, source_lang)
+            if translated:
+                item["text"] = translated
+
+    # 4. Smart Duration Enforcement (Readability Fix)
+    # Ensure subtitles stay on screen for at least 1.5s if there is empty space.
+    final_segments = []
+    min_duration = 1.5 
+
+    for i, s in enumerate(processed_data):
+        # Check start of next segment to know boundary
+        next_start = processed_data[i+1]["start"] if i < len(processed_data) - 1 else float('inf')
+        
+        current_dur = s["end"] - s["start"]
+        
+        # Calculate available room to extend (leaving 0.1s gap)
+        available_room = max(0, (next_start - 0.1) - s["end"])
+        
+        # If segment is too fast to read, try to extend into the silence
+        if current_dur < min_duration:
+            needed = min_duration - current_dur
+            # Extend only as much as space allows
+            s["end"] += min(needed, available_room)
+            
+        final_segments.append(s)
+
+    return final_segments
+
+@app.post("/v1/audio/transcriptions")
+async def transcribe(
+    file: UploadFile = File(...),
+    model_name: str = Form(None, alias="model"),
+    response_format: str = Form("json"),
+    language: str = Form(None),
+    task: str = Form("transcribe")
+):
+    tmp_path = None
+    start_time = time.time()
+    
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            payload = await file.read()
+            if not payload:
+                raise HTTPException(status_code=400, detail="Empty file uploaded")
+            tmp.write(payload)
+            tmp_path = tmp.name
+
+        # target_lang is what the user wants (e.g., 'id' or 'en')
+        target_lang = language if language else "id"
+        # Whisper native 'translate' only supports target='en'
+        use_whisper_native_translate = (task == "translate" and target_lang == "en")
+        
+        async with whisper_semaphore:
+            logger.info(f"Processing job for file {file.filename} (Target: {target_lang})")
+            
+            # We ALWAYS use auto-detection for the source language to avoid 
+            # feeding the target language (e.g. 'id') as the source language to Whisper.
+            segments_gen, info = model.transcribe(
+                tmp_path,
+                task="translate" if use_whisper_native_translate else "transcribe",
+                language="zh", # Force source language to Chinese
+                initial_prompt=DRACIN_PROMPT,
+                beam_size=7,   # Increased for better Chinese recognition
+                temperature=0,
+                word_timestamps=True, # Improves sync accuracy significantly
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=1000, speech_pad_ms=400) # Relaxed VAD: 1s silence to split, 400ms pad
+            )
+            raw_segments = list(segments_gen)
+            source_lang = info.language
+            logger.info(f"Detected source language: {source_lang}")
+
+        # If we used native translate to 'en', we don't need further translation
+        # Unless the source was already English, or we want a different target.
+        needs_external_translate = False
+        if target_lang != source_lang:
+            if not use_whisper_native_translate:
+                needs_external_translate = True
+            elif target_lang != "en":
+                # This case shouldn't happen with current logic but for safety:
+                needs_external_translate = True
+
+        processed_data = await process_and_translate_segments(
+            raw_segments, 
+            target_lang, 
+            needs_external_translate,
+            source_lang
+        )
+
+        if response_format == "vtt":
+            content = ["WEBVTT\n"]
+            for r in processed_data:
+                start = format_timestamp(r["start"])
+                end = format_timestamp(r["end"])
+                content.append(f"{start} --> {end}\n{r['text']}\n")
+            return PlainTextResponse("\n".join(content))
+        
+        full_text = " ".join([r["text"] for r in processed_data])
+        return {"text": full_text.strip()}
+
+    except Exception as e:
+        logger.exception("Inference error")
+        raise HTTPException(status_code=500, detail="Internal server error during processing")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception as e:
+                logger.error(f"Failed to delete temp file {tmp_path}: {e}")
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app, 
+        host=os.getenv("HOST", "0.0.0.0"), 
+        port=int(os.getenv("PORT", "9002")),
+        timeout_keep_alive=60 
+    )
