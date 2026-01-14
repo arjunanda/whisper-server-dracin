@@ -10,9 +10,6 @@ from fastapi.responses import PlainTextResponse
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 import requests
-import re
-
-HAN_RE = re.compile(r'[\u4e00-\u9fff]')
 
 # from opentelemetry import trace
 # from opentelemetry.sdk.resources import Resource
@@ -63,75 +60,68 @@ DRACIN_PROMPT = "Mandarin Chinese (simplified) drama dialogue. Casual, colloquia
 logger.info(f"Loading Whisper model '{WHISPER_MODEL_NAME}' on {WHISPER_DEVICE}...")
 model = WhisperModel(WHISPER_MODEL_NAME, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
 
-whisper_lock = asyncio.Lock()
+whisper_semaphore = asyncio.Semaphore(WHISPER_MAX_JOBS)
 
 class TranslationManager:
     @staticmethod
-    def _sync_translate(text: str, target_lang: str) -> str:
-        """Blocking translation call with source='auto'."""
+    def _sync_translate(text: str, target_lang: str, source_lang: str = "auto") -> str:
+        """Blocking translation call to be run in a thread."""
+        # Normalize source_lang for Google (zh -> zh-CN)
+        s_lang = source_lang
+        if TRANSLATE_PROVIDER == "google" and s_lang == "zh": s_lang = "zh-CN"
+
+        # Bersihkan teks Mandarin dari simbol aneh sebelum dikirim
         text = text.strip()
-        if not text: return text
         
+        # Simple retry logic (up to 3 attempts with increasing delay)
         last_exception = None
         for attempt in range(3):
             try:
                 if TRANSLATE_PROVIDER == "google":
-                    if attempt > 0: time.sleep(0.5 * attempt)
-                    result = GoogleTranslator(source="auto", target=target_lang).translate(text)
-                    if result and HAN_RE.search(result) and attempt < 2:
-                        continue
-                    return result
+                    # Google Translate benefits from a small delay on retries to avoid rate limits
+                    if attempt > 0:
+                        time.sleep(0.5 * attempt)
+                    return GoogleTranslator(source=s_lang, target=target_lang).translate(text)
                 elif TRANSLATE_PROVIDER == "libre":
                     resp = requests.post(
                         LIBRE_TRANSLATE_URL,
-                        json={"q": text, "source": "auto", "target": target_lang, "format": "text"},
+                        json={"q": text, "source": s_lang, "target": target_lang, "format": "text"},
                         timeout=TRANSLATE_TIMEOUT
                     )
                     if resp.status_code == 200:
                         return resp.json().get("translatedText", text)
+                    else:
+                        logger.warning(f"LibreTranslate returned status {resp.status_code}: {resp.text}")
             except Exception as e:
                 last_exception = e
-                if attempt < 2: time.sleep(0.5)
+                logger.warning(f"Translation attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(0.5)
         
         if last_exception:
-            logger.error(f"Translation failed: {last_exception}")
+            logger.error(f"Translation failed after 3 attempts: {last_exception}")
+        
         return text
 
     @classmethod
-    async def translate_batch_async(cls, texts: List[str], target_lang: str) -> List[str]:
-        """Translates multiple texts in batches to reduce API overhead."""
-        if TRANSLATE_PROVIDER == "off" or not texts:
-            return texts
-            
-        batch_size = 8
-        delimiter = "\n\n<<<SEG>>>\n\n"
-        results = []
+    async def translate_async(cls, text: str, target_lang: str, source_lang: str = "auto") -> str:
+        """Non-blocking translation with hard timeout and thread offloading."""
+        if TRANSLATE_PROVIDER == "off" or not text.strip():
+            return text
         
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            joined_text = delimiter.join(batch)
-            
-            try:
-                translated_joined = await asyncio.wait_for(
-                    asyncio.to_thread(cls._sync_translate, joined_text, target_lang),
-                    timeout=TRANSLATE_TIMEOUT
-                )
-                
-                # Split and clean. Handle potential whitespace normalization by translators.
-                translated_segments = [s.strip() for s in translated_joined.split("<<<SEG>>>")]
-                # Filter empty segments that might occur if split left artifacts
-                translated_segments = [s for s in translated_segments if s]
-                
-                if len(translated_segments) == len(batch):
-                    results.extend(translated_segments)
-                else:
-                    logger.warning(f"Batch size mismatch: expected {len(batch)}, got {len(translated_segments)}. Falling back.")
-                    results.extend(batch)
-            except Exception as e:
-                logger.error(f"Batch translation error: {e}")
-                results.extend(batch)
-                
-        return results
+        try:
+            logger.debug(f"Translating {source_lang} -> {target_lang}: {text[:30]}...")
+            translated = await asyncio.wait_for(
+                asyncio.to_thread(cls._sync_translate, text, target_lang, source_lang),
+                timeout=TRANSLATE_TIMEOUT
+            )
+            return translated
+        except asyncio.TimeoutError:
+            logger.error(f"Translation timed out after {TRANSLATE_TIMEOUT}s for text: {text[:30]}...")
+        except Exception as e:
+            logger.error(f"Translation failed ({TRANSLATE_PROVIDER}): {e}")
+        
+        return text # Fallback to original text
 
 def is_valid_segment(s) -> bool:
     text = s.text.strip()
@@ -230,9 +220,20 @@ def regroup_by_words(segments, max_chars=40, max_dur=2.5, max_gap=0.6):
         
     return new_segments
 
-async def process_and_translate_segments(segments, target_lang: str, needs_translation: bool):
-    valid_raw_segments = [s for s in segments if is_valid_segment(s)]
-    if not valid_raw_segments: return []
+async def process_and_translate_segments(segments, target_lang: str, needs_translation: bool, source_lang: str = "auto"):
+    logger.info(f"Processing raw segments... Needs translate: {needs_translation}")
+    
+    # 1. Filter valid segments FIRST
+    valid_raw_segments = []
+    for i, s in enumerate(segments):
+        if is_valid_segment(s):
+            valid_raw_segments.append(s)
+        else:
+            logger.debug(f"Segment {i} filtered.")
+    
+    if not valid_raw_segments:
+        logger.warning("No valid segments found.")
+        return []
 
     # 2. Regroup based on Words (Natural Flow)
     # Modified parameters for better readability:
@@ -243,10 +244,11 @@ async def process_and_translate_segments(segments, target_lang: str, needs_trans
 
     # 3. Translate the NEW segments
     if needs_translation:
-        texts_to_translate = [item["text"] for item in processed_data]
-        translated_texts = await TranslationManager.translate_batch_async(texts_to_translate, target_lang)
-        for i, translated in enumerate(translated_texts):
-            processed_data[i]["text"] = translated
+        logger.info(f"Translating {len(processed_data)} segments...")
+        for i, item in enumerate(processed_data):
+            translated = await TranslationManager.translate_async(item["text"], target_lang, source_lang)
+            if translated:
+                item["text"] = translated
 
     # 4. Smart Duration Enforcement (Readability Fix)
     # Ensure subtitles stay on screen for at least 1.5s if there is empty space.
@@ -293,26 +295,21 @@ async def transcribe(
 
         # target_lang is what the user wants (e.g., 'id' or 'en')
         target_lang = language if language else "id"
-        # Whisper native 'translate' is NEVER used
+        # Whisper native 'translate' only supports target='en', but we prefer Google Translate
+        # for better accuracy and consistency with the Indonesian logic.
         use_whisper_native_translate = False
         
-        if whisper_lock.locked():
-            raise HTTPException(
-                status_code=429,
-                detail="Server busy, try again later"
-            )
-            
-        async with whisper_lock:
+        async with whisper_semaphore:
             logger.info(f"Processing job for file {file.filename} (Target: {target_lang})")
             
             # We ALWAYS use auto-detection for the source language to avoid 
             # feeding the target language (e.g. 'id') as the source language to Whisper.
             segments_gen, info = model.transcribe(
                 tmp_path,
-                task="transcribe",
+                task="translate" if use_whisper_native_translate else "transcribe",
                 language="zh", # Force source language to Chinese
                 initial_prompt=DRACIN_PROMPT,
-                beam_size=5,   # Increased for better Chinese recognition
+                beam_size=7,   # Increased for better Chinese recognition
                 temperature=0,
                 word_timestamps=True, # Improves sync accuracy significantly
                 vad_filter=True,
@@ -322,13 +319,21 @@ async def transcribe(
             source_lang = info.language
             logger.info(f"Detected source language: {source_lang}")
 
-        # ALWAYS translate externally if provider is not off
-        needs_external_translate = (TRANSLATE_PROVIDER != "off")
+        # If we used native translate to 'en', we don't need further translation
+        # Unless the source was already English, or we want a different target.
+        needs_external_translate = False
+        if target_lang != source_lang:
+            if not use_whisper_native_translate:
+                needs_external_translate = True
+            elif target_lang != "en":
+                # This case shouldn't happen with current logic but for safety:
+                needs_external_translate = True
 
         processed_data = await process_and_translate_segments(
             raw_segments, 
             target_lang, 
-            needs_external_translate
+            needs_external_translate,
+            source_lang
         )
 
         if response_format == "vtt":
