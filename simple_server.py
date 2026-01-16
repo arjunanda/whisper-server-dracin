@@ -11,6 +11,7 @@ from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 import requests
 import re
+import copy
 
 HAN_RE = re.compile(r'[\u4e00-\u9fff]')
 
@@ -230,47 +231,44 @@ def regroup_by_words(segments, max_chars=40, max_dur=2.5, max_gap=0.6):
         
     return new_segments
 
-async def process_and_translate_segments(segments, target_lang: str, needs_translation: bool):
+async def process_segments_for_langs(segments, target_langs: List[str], needs_translation: bool):
     valid_raw_segments = [s for s in segments if is_valid_segment(s)]
-    if not valid_raw_segments: return []
+    if not valid_raw_segments: return {}
 
-    # 2. Regroup based on Words (Natural Flow)
-    # Modified parameters for better readability:
-    # max_gap=1.0: Don't split on short pauses (<1s), keeps phrases together.
-    # max_chars=42: Slightly more text allowed.
-    processed_data = regroup_by_words(valid_raw_segments, max_chars=42, max_dur=3.5, max_gap=1.0)
-    logger.info(f"Regrouped into {len(processed_data)} natural segments.")
+    # 1. Regroup based on Words (Natural Flow) - Done ONCE
+    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=42, max_dur=3.5, max_gap=1.0)
+    logger.info(f"Regrouped into {len(processed_data_template)} natural segments.")
 
-    # 3. Translate the NEW segments
-    if needs_translation:
-        texts_to_translate = [item["text"] for item in processed_data]
-        translated_texts = await TranslationManager.translate_batch_async(texts_to_translate, target_lang)
-        for i, translated in enumerate(translated_texts):
-            processed_data[i]["text"] = translated
-
-    # 4. Smart Duration Enforcement (Readability Fix)
-    # Ensure subtitles stay on screen for at least 1.5s if there is empty space.
-    final_segments = []
-    min_duration = 1.5 
-
-    for i, s in enumerate(processed_data):
-        # Check start of next segment to know boundary
-        next_start = processed_data[i+1]["start"] if i < len(processed_data) - 1 else float('inf')
+    results = {}
+    for lang in target_langs:
+        # Deep copy template for each language
+        processed_data = copy.deepcopy(processed_data_template)
         
-        current_dur = s["end"] - s["start"]
-        
-        # Calculate available room to extend (leaving 0.1s gap)
-        available_room = max(0, (next_start - 0.1) - s["end"])
-        
-        # If segment is too fast to read, try to extend into the silence
-        if current_dur < min_duration:
-            needed = min_duration - current_dur
-            # Extend only as much as space allows
-            s["end"] += min(needed, available_room)
+        # 2. Translate the NEW segments
+        if needs_translation:
+            texts_to_translate = [item["text"] for item in processed_data]
+            translated_texts = await TranslationManager.translate_batch_async(texts_to_translate, lang)
+            for i, translated in enumerate(translated_texts):
+                processed_data[i]["text"] = translated
+
+        # 3. Smart Duration Enforcement (Readability Fix)
+        final_segments = []
+        min_duration = 1.5 
+
+        for i, s in enumerate(processed_data):
+            next_start = processed_data[i+1]["start"] if i < len(processed_data) - 1 else float('inf')
+            current_dur = s["end"] - s["start"]
+            available_room = max(0, (next_start - 0.1) - s["end"])
             
-        final_segments.append(s)
+            if current_dur < min_duration:
+                needed = min_duration - current_dur
+                s["end"] += min(needed, available_room)
+                
+            final_segments.append(s)
+        
+        results[lang] = final_segments
 
-    return final_segments
+    return results
 
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
@@ -291,8 +289,8 @@ async def transcribe(
             tmp.write(payload)
             tmp_path = tmp.name
 
-        # target_lang is what the user wants (e.g., 'id' or 'en')
-        target_lang = language if language else "id"
+        # target_langs is what the user wants (e.g., 'id' or 'en' or 'id,en')
+        target_langs = language.split(",") if language else ["id"]
         # Whisper native 'translate' is NEVER used
         use_whisper_native_translate = False
         
@@ -303,7 +301,7 @@ async def transcribe(
             )
             
         async with whisper_lock:
-            logger.info(f"Processing job for file {file.filename} (Target: {target_lang})")
+            logger.info(f"Processing job for file {file.filename} (Targets: {target_langs})")
             
             # We ALWAYS use auto-detection for the source language to avoid 
             # feeding the target language (e.g. 'id') as the source language to Whisper.
@@ -325,22 +323,43 @@ async def transcribe(
         # ALWAYS translate externally if provider is not off
         needs_external_translate = (TRANSLATE_PROVIDER != "off")
 
-        processed_data = await process_and_translate_segments(
+        multi_processed_data = await process_segments_for_langs(
             raw_segments, 
-            target_lang, 
+            target_langs, 
             needs_external_translate
         )
 
         if response_format == "vtt":
-            content = ["WEBVTT\n"]
-            for r in processed_data:
-                start = format_timestamp(r["start"])
-                end = format_timestamp(r["end"])
-                content.append(f"{start} --> {end}\n{r['text']}\n")
-            return PlainTextResponse("\n".join(content))
+            if len(target_langs) == 1:
+                lang = target_langs[0]
+                content = ["WEBVTT\n"]
+                for r in multi_processed_data.get(lang, []):
+                    start = format_timestamp(r["start"])
+                    end = format_timestamp(r["end"])
+                    content.append(f"{start} --> {end}\n{r['text']}\n")
+                return PlainTextResponse("\n".join(content))
+            else:
+                # Return multiple VTTs in JSON
+                vtt_results = {}
+                for lang in target_langs:
+                    content = ["WEBVTT\n"]
+                    for r in multi_processed_data.get(lang, []):
+                        start = format_timestamp(r["start"])
+                        end = format_timestamp(r["end"])
+                        content.append(f"{start} --> {end}\n{r['text']}\n")
+                    vtt_results[lang] = "\n".join(content)
+                return vtt_results
         
-        full_text = " ".join([r["text"] for r in processed_data])
-        return {"text": full_text.strip()}
+        if len(target_langs) == 1:
+            lang = target_langs[0]
+            full_text = " ".join([r["text"] for r in multi_processed_data.get(lang, [])])
+            return {"text": full_text.strip()}
+        else:
+            json_results = {}
+            for lang in target_langs:
+                full_text = " ".join([r["text"] for r in multi_processed_data.get(lang, [])])
+                json_results[lang] = {"text": full_text.strip()}
+            return json_results
 
     except Exception as e:
         logger.exception("Inference error")
