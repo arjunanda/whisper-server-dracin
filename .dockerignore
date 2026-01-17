@@ -4,3 +4,5 @@
 !uv.lock
 !model_aliases.json
 !realtime-console
+!requirements.txt
+!simple_server.py
