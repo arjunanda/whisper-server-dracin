@@ -69,7 +69,7 @@ whisper_lock = asyncio.Lock()
 class TranslationManager:
     @staticmethod
     def _sync_translate(text: str, target_lang: str) -> str:
-        """Blocking translation call with source='auto'."""
+        """Blocking translation call. Forcing source='zh-CN' for Dracin context."""
         text = text.strip()
         if not text: return text
         
@@ -78,14 +78,17 @@ class TranslationManager:
             try:
                 if TRANSLATE_PROVIDER == "google":
                     if attempt > 0: time.sleep(0.5 * attempt)
-                    result = GoogleTranslator(source="auto", target=target_lang).translate(text)
-                    if result and HAN_RE.search(result) and attempt < 2:
+                    # Force zh-CN to avoid auto-detection failure
+                    result = GoogleTranslator(source="zh-CN", target=target_lang).translate(text)
+                    
+                    # More robust check: only retry if result is EXACTLY the same as input AND contains Han characters
+                    if result == text and HAN_RE.search(result) and attempt < 2:
                         continue
                     return result
                 elif TRANSLATE_PROVIDER == "libre":
                     resp = requests.post(
                         LIBRE_TRANSLATE_URL,
-                        json={"q": text, "source": "auto", "target": target_lang, "format": "text"},
+                        json={"q": text, "source": "zh", "target": target_lang, "format": "text"},
                         timeout=TRANSLATE_TIMEOUT
                     )
                     if resp.status_code == 200:
@@ -100,40 +103,37 @@ class TranslationManager:
 
     @classmethod
     async def translate_batch_async(cls, texts: List[str], target_lang: str) -> List[str]:
-        """Translates multiple texts in batches to reduce API overhead."""
+        """Translates multiple texts using the library's built-in batching."""
         if TRANSLATE_PROVIDER == "off" or not texts:
             return texts
             
-        batch_size = 8
         results = []
+        batch_size = 10 # deep-translator handles its own internal batching but we chunk to avoid massive payloads
         
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
-            # Use a more robust delimiter
-            delimiter = f"\n\n--- SEG {int(time.time())} ---\n\n"
-            joined_text = delimiter.join(batch)
             
             try:
-                translated_joined = await asyncio.wait_for(
-                    asyncio.to_thread(cls._sync_translate, joined_text, target_lang),
-                    timeout=TRANSLATE_TIMEOUT
-                )
-                
-                # Split and clean.
-                translated_segments = [s.strip() for s in translated_joined.split(delimiter.strip())]
-                # Filter empty segments
-                translated_segments = [s for s in translated_segments if s]
-                
-                if len(translated_segments) == len(batch):
-                    results.extend(translated_segments)
+                if TRANSLATE_PROVIDER == "google":
+                    # Use built-in translate_batch which is more robust than manual joining
+                    translated_batch = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            lambda: GoogleTranslator(source="zh-CN", target=target_lang).translate_batch(batch)
+                        ),
+                        timeout=TRANSLATE_TIMEOUT * 2
+                    )
+                    results.extend(translated_batch)
                 else:
-                    logger.warning(f"Batch mismatch: expected {len(batch)}, got {len(translated_segments)}. Falling back to individual.")
+                    # Fallback to individual for other providers (or implement their batching)
                     for txt in batch:
-                        results.append(cls._sync_translate(txt, target_lang))
+                        results.append(await asyncio.to_thread(cls._sync_translate, txt, target_lang))
             except Exception as e:
                 logger.error(f"Batch translation error: {e}. Falling back to individual.")
                 for txt in batch:
-                    results.append(cls._sync_translate(txt, target_lang))
+                    try:
+                        results.append(await asyncio.to_thread(cls._sync_translate, txt, target_lang))
+                    except:
+                        results.append(txt) # Return original on total failure
                 
         return results
 
@@ -146,12 +146,12 @@ def is_valid_segment(s) -> bool:
     if len(text) < 1: 
         return False
     
-    # Relaxed thresholds for better sensitivity (APPROVED)
-    if s.no_speech_prob > 0.99: 
+    # Balanced thresholds to avoid noise/hallucinations (REFINED)
+    if s.no_speech_prob > 0.98: # Was 0.99, back to slightly more strict
         return False 
-    if s.avg_logprob < -2.0:  
+    if s.avg_logprob < -1.8:    # Was -2.0, back to slightly more strict
         return False
-    if (s.end - s.start) < 0.1: 
+    if (s.end - s.start) < 0.2: # Was 0.1, back to 0.2
         return False
     return True
 
