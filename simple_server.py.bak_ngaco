@@ -103,53 +103,37 @@ class TranslationManager:
 
     @classmethod
     async def translate_batch_async(cls, texts: List[str], target_lang: str) -> List[str]:
-        """Translates multiple texts in batches using a context-aware joining strategy."""
+        """Translates multiple texts using the library's built-in batching."""
         if TRANSLATE_PROVIDER == "off" or not texts:
             return texts
             
         results = []
-        batch_size = 8 
+        batch_size = 10 # deep-translator handles its own internal batching but we chunk to avoid massive payloads
         
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             
-            # Using numeric markers helps Google Translate maintain context 
-            # while keeping segments separable. e.g. "1. Teks... 2. Teks..."
-            joined_text = "\n".join([f"{idx+1}. {txt}" for idx, txt in enumerate(batch)])
-            
             try:
                 if TRANSLATE_PROVIDER == "google":
-                    translated_joined = await asyncio.wait_for(
-                        asyncio.to_thread(cls._sync_translate, joined_text, target_lang),
-                        timeout=TRANSLATE_TIMEOUT + (len(batch) * 0.5)
+                    # Use built-in translate_batch which is more robust than manual joining
+                    translated_batch = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            lambda: GoogleTranslator(source="zh-CN", target=target_lang).translate_batch(batch)
+                        ),
+                        timeout=TRANSLATE_TIMEOUT * 2
                     )
-                    
-                    # Split back and remove numbering
-                    # We look for "1. ", "2. ", etc.
-                    parts = []
-                    for idx in range(len(batch)):
-                        pattern = rf"(?m)^{idx+1}\.\s*(.*)"
-                        match = re.search(pattern, translated_joined)
-                        if match:
-                            parts.append(match.group(1).strip())
-                        else:
-                            # Fallback if numbering was messed up by translator
-                            parts.append("") 
-
-                    # If length matches, great. If not, fallback to individual.
-                    if len(parts) == len(batch) and all(parts):
-                        results.extend(parts)
-                    else:
-                        logger.warning(f"Batch recovery failed for index {i}. Falling back to individual.")
-                        for txt in batch:
-                            results.append(cls._sync_translate(txt, target_lang))
+                    results.extend(translated_batch)
                 else:
+                    # Fallback to individual for other providers (or implement their batching)
                     for txt in batch:
-                        results.append(cls._sync_translate(txt, target_lang))
+                        results.append(await asyncio.to_thread(cls._sync_translate, txt, target_lang))
             except Exception as e:
                 logger.error(f"Batch translation error: {e}. Falling back to individual.")
                 for txt in batch:
-                    results.append(cls._sync_translate(txt, target_lang))
+                    try:
+                        results.append(await asyncio.to_thread(cls._sync_translate, txt, target_lang))
+                    except:
+                        results.append(txt) # Return original on total failure
                 
         return results
 
@@ -255,9 +239,7 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
     if not valid_raw_segments: return {}
 
     # 1. Regroup based on Words (Natural Flow) - Done ONCE
-    # Reduced max_chars to 25 to be more subtitle-friendly for Chinese source
-    # Adjusted max_gap to 0.7 for more natural speaker/phrase breaks
-    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=25, max_dur=3.0, max_gap=0.7)
+    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=42, max_dur=3.5, max_gap=1.0)
     logger.info(f"Regrouped into {len(processed_data_template)} natural segments.")
 
     results = {}
@@ -336,9 +318,9 @@ async def transcribe(
                 word_timestamps=True, # Improves sync accuracy significantly
                 vad_filter=True,
                 vad_parameters=dict(
-                    min_silence_duration_ms=1000, # Back to 1s, 3s was too long
-                    speech_pad_ms=500, # Balanced padding
-                    threshold=0.35
+                    min_silence_duration_ms=3000, 
+                    speech_pad_ms=800, 
+                    threshold=0.3
                 ) # Optimized Sensitive VAD
             )
             raw_segments = list(segments_gen)
