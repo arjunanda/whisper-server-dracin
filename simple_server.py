@@ -105,11 +105,12 @@ class TranslationManager:
             return texts
             
         batch_size = 8
-        delimiter = "\n\n<<<SEG>>>\n\n"
         results = []
         
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
+            # Use a more robust delimiter
+            delimiter = f"\n\n--- SEG {int(time.time())} ---\n\n"
             joined_text = delimiter.join(batch)
             
             try:
@@ -118,19 +119,21 @@ class TranslationManager:
                     timeout=TRANSLATE_TIMEOUT
                 )
                 
-                # Split and clean. Handle potential whitespace normalization by translators.
-                translated_segments = [s.strip() for s in translated_joined.split("<<<SEG>>>")]
-                # Filter empty segments that might occur if split left artifacts
+                # Split and clean.
+                translated_segments = [s.strip() for s in translated_joined.split(delimiter.strip())]
+                # Filter empty segments
                 translated_segments = [s for s in translated_segments if s]
                 
                 if len(translated_segments) == len(batch):
                     results.extend(translated_segments)
                 else:
-                    logger.warning(f"Batch size mismatch: expected {len(batch)}, got {len(translated_segments)}. Falling back.")
-                    results.extend(batch)
+                    logger.warning(f"Batch mismatch: expected {len(batch)}, got {len(translated_segments)}. Falling back to individual.")
+                    for txt in batch:
+                        results.append(cls._sync_translate(txt, target_lang))
             except Exception as e:
-                logger.error(f"Batch translation error: {e}")
-                results.extend(batch)
+                logger.error(f"Batch translation error: {e}. Falling back to individual.")
+                for txt in batch:
+                    results.append(cls._sync_translate(txt, target_lang))
                 
         return results
 
@@ -143,12 +146,12 @@ def is_valid_segment(s) -> bool:
     if len(text) < 1: 
         return False
     
-    # Relaxed thresholds for better sensitivity
-    if s.no_speech_prob > 0.95: # Very lenient (was 0.8)
+    # Relaxed thresholds for better sensitivity (APPROVED)
+    if s.no_speech_prob > 0.99: 
         return False 
-    if s.avg_logprob < -1.5:  # Very lenient (was -1.2)
+    if s.avg_logprob < -2.0:  
         return False
-    if (s.end - s.start) < 0.2: # More lenient (was 0.3)
+    if (s.end - s.start) < 0.1: 
         return False
     return True
 
@@ -314,7 +317,11 @@ async def transcribe(
                 temperature=0,
                 word_timestamps=True, # Improves sync accuracy significantly
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=1000, speech_pad_ms=400) # Relaxed VAD: 1s silence to split, 400ms pad
+                vad_parameters=dict(
+                    min_silence_duration_ms=3000, 
+                    speech_pad_ms=800, 
+                    threshold=0.3
+                ) # Optimized Sensitive VAD
             )
             raw_segments = list(segments_gen)
             source_lang = info.language
