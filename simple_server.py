@@ -66,6 +66,13 @@ model = WhisperModel(WHISPER_MODEL_NAME, device=WHISPER_DEVICE, compute_type=WHI
 
 whisper_lock = asyncio.Lock()
 
+def is_probably_untranslated(src, dst):
+    if src == dst:
+        return True
+    han_src = len(HAN_RE.findall(src))
+    han_dst = len(HAN_RE.findall(dst))
+    return han_src > 0 and (han_dst / han_src) > 0.6
+
 class TranslationManager:
     @staticmethod
     def _sync_translate(text: str, target_lang: str) -> str:
@@ -81,8 +88,8 @@ class TranslationManager:
                     # Force zh-CN to avoid auto-detection failure
                     result = GoogleTranslator(source="zh-CN", target=target_lang).translate(text)
                     
-                    # More robust check: only retry if result is EXACTLY the same as input AND contains Han characters
-                    if result == text and HAN_RE.search(result) and attempt < 2:
+                    # More robust check: only retry if result is probably untranslated
+                    if is_probably_untranslated(text, result) and attempt < 2:
                         continue
                     return result
                 elif TRANSLATE_PROVIDER == "libre":
@@ -128,7 +135,7 @@ class TranslationManager:
                     # We look for "1. ", "2. ", etc.
                     parts = []
                     for idx in range(len(batch)):
-                        pattern = rf"(?m)^{idx+1}\.\s*(.*)"
+                        pattern = rf"(?m)^{idx+1}[\.\)\-]?\s*(.*)"
                         match = re.search(pattern, translated_joined)
                         if match:
                             parts.append(match.group(1).strip())
@@ -163,11 +170,11 @@ def is_valid_segment(s) -> bool:
         return False
     
     # Balanced thresholds to avoid noise/hallucinations (REFINED)
-    if s.no_speech_prob > 0.98: # Was 0.99, back to slightly more strict
+    if s.no_speech_prob > 0.995: # Was 0.995, back to slightly more strict
         return False 
-    if s.avg_logprob < -1.8:    # Was -2.0, back to slightly more strict
+    if s.avg_logprob < -2.5:    # Was -2.0, back to slightly more strict
         return False
-    if (s.end - s.start) < 0.2: # Was 0.1, back to 0.2
+    if (s.end - s.start) < 0.15: # Was 0.1, back to 0.2
         return False
     return True
 
@@ -181,51 +188,43 @@ def format_timestamp(seconds: float) -> str:
 
 
 def regroup_by_words(segments, max_chars=40, max_dur=2.5, max_gap=0.6):
-    """
-    Reconstruct segments from word timestamps to effectively 'split' long lines 
-    and 'merge' short ones naturally based on pauses and punctuation.
-    """
     new_segments = []
     current_words = []
     current_len = 0
     current_start = 0.0
     last_end = 0.0
-    
-    # Flatten all words from VALID segments
-    all_words = []
-    for s in segments:
-        if hasattr(s, 'words') and s.words:
-            all_words.extend(s.words)
-    
-    if not all_words:
-        # Fallback if no word info available
-        for s in segments:
-            new_segments.append({
-                "start": s.start,
-                "end": s.end,
-                "text": s.text.strip()
-            })
-        return new_segments
 
+    all_words = []
+    fallback_segments = []
+
+    for s in segments:
+        if hasattr(s, "words") and s.words:
+            all_words.extend(s.words)
+        else:
+            if s.text.strip():
+                fallback_segments.append({
+                    "start": s.start,
+                    "end": s.end,
+                    "text": s.text.strip()
+                })
+
+    # 🔴 Kalau TIDAK ADA word timestamps sama sekali
+    if not all_words:
+        return fallback_segments
+
+    # 🔵 Regroup berbasis word timestamps
     for w in all_words:
-        # initialize start of new segment
         if not current_words:
             current_start = w.start
-        
-        # Check for meaningful gap (silence)
+
         is_gap = (w.start - last_end) > max_gap if last_end > 0 else False
-        
-        # Check length / duration
-        # Note: w.word usually includes leading space for latin languages
         w_len = len(w.word)
         is_long = (current_len + w_len) > max_chars
         is_toolong_dur = (w.end - current_start) > max_dur
-        
-        # Check punctuation (Sentence endings)
+
         text_so_far = "".join(current_words).strip()
         has_punctuation = text_so_far and text_so_far[-1] in ['.', '?', '!', '。', '？', '！']
-        
-        # DECIDE TO SPLIT
+
         if current_words and (is_gap or is_long or is_toolong_dur or has_punctuation):
             new_segments.append({
                 "start": current_start,
@@ -235,20 +234,32 @@ def regroup_by_words(segments, max_chars=40, max_dur=2.5, max_gap=0.6):
             current_words = []
             current_len = 0
             current_start = w.start
-        
+
         current_words.append(w.word)
         current_len += w_len
         last_end = w.end
 
-    # Flush last chunk
     if current_words:
         new_segments.append({
             "start": current_start,
             "end": last_end,
             "text": "".join(current_words).strip()
         })
-        
-    return new_segments
+
+    # 🔵 Gabungkan fallback TANPA tabrakan waktu
+    merged = new_segments[:]
+
+    for fb in fallback_segments:
+        overlap = False
+        for seg in new_segments:
+            if not (fb["end"] <= seg["start"] or fb["start"] >= seg["end"]):
+                overlap = True
+                break
+        if not overlap:
+            merged.append(fb)
+
+    merged.sort(key=lambda x: x["start"])
+    return merged
 
 async def process_segments_for_langs(segments, target_langs: List[str], needs_translation: bool):
     valid_raw_segments = [s for s in segments if is_valid_segment(s)]
@@ -334,7 +345,7 @@ async def transcribe(
                 beam_size=5,   # Increased for better Chinese recognition
                 temperature=0,
                 word_timestamps=True, # Improves sync accuracy significantly
-                vad_filter=True,
+                vad_filter=False,
                 vad_parameters=dict(
                     min_silence_duration_ms=1000, # Back to 1s, 3s was too long
                     speech_pad_ms=500, # Balanced padding
