@@ -169,8 +169,7 @@ def is_valid_segment(s) -> bool:
     if not text: 
         return False
     
-    # Minimum 2 characters for Chinese to avoid single-char noise
-    if len(text) < 2: 
+    if len(text) < 2 and not HAN_RE.search(text):
         return False
     
     # STRICTER thresholds to reduce hallucinations
