@@ -57,8 +57,11 @@ TRANSLATE_PROVIDER = os.getenv("TRANSLATE_PROVIDER", "google").lower() # google 
 LIBRE_TRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://localhost:5000/translate")
 
 # --- INITIAL PROMPT FOR BETTER CONTEXT ---
-# This helps the model stay in the right language and style (Chinese Drama aka Dracin)
-DRACIN_PROMPT = "Mandarin Chinese (simplified) drama dialogue. Casual, colloquial. 电视剧普通话对白，日常口语。"
+# Enhanced prompt with common drama phrases to improve recognition
+# This helps Whisper understand the context and style of Chinese drama dialogue
+DRACIN_PROMPT = """中国电视剧对白。普通话，简体中文。日常口语，情感丰富。
+常见词汇：你好，谢谢，对不起，没关系，怎么了，为什么，我爱你，别走。
+Chinese TV drama dialogue. Mandarin, simplified. Casual, emotional, colloquial."""
 
 # --- SINGLETON MODEL & CONCURRENCY CONTROL ---
 logger.info(f"Loading Whisper model '{WHISPER_MODEL_NAME}' on {WHISPER_DEVICE}...")
@@ -66,12 +69,7 @@ model = WhisperModel(WHISPER_MODEL_NAME, device=WHISPER_DEVICE, compute_type=WHI
 
 whisper_lock = asyncio.Lock()
 
-def is_probably_untranslated(src, dst):
-    if src == dst:
-        return True
-    han_src = len(HAN_RE.findall(src))
-    han_dst = len(HAN_RE.findall(dst))
-    return han_src > 0 and (han_dst / han_src) > 0.6
+
 
 class TranslationManager:
     @staticmethod
@@ -80,49 +78,46 @@ class TranslationManager:
         text = text.strip()
         if not text: return text
         
-        last_exception = None
-        for attempt in range(3):
-            try:
-                if TRANSLATE_PROVIDER == "google":
-                    if attempt > 0: time.sleep(0.5 * attempt)
-                    # Force zh-CN to avoid auto-detection failure
-                    result = GoogleTranslator(source="zh-CN", target=target_lang).translate(text)
-                    
-                    # More robust check: only retry if result is probably untranslated
-                    if is_probably_untranslated(text, result) and attempt < 2:
-                        continue
-                    return result
-                elif TRANSLATE_PROVIDER == "libre":
-                    resp = requests.post(
-                        LIBRE_TRANSLATE_URL,
-                        json={"q": text, "source": "zh", "target": target_lang, "format": "text"},
-                        timeout=TRANSLATE_TIMEOUT
-                    )
-                    if resp.status_code == 200:
-                        return resp.json().get("translatedText", text)
-            except Exception as e:
-                last_exception = e
-                if attempt < 2: time.sleep(0.5)
+        try:
+            if TRANSLATE_PROVIDER == "google":
+                # Force zh-CN to avoid auto-detection failure
+                # Single attempt - no retry to avoid inconsistency
+                result = GoogleTranslator(source="zh-CN", target=target_lang).translate(text)
+                return result if result else text
+            elif TRANSLATE_PROVIDER == "libre":
+                resp = requests.post(
+                    LIBRE_TRANSLATE_URL,
+                    json={"q": text, "source": "zh", "target": target_lang, "format": "text"},
+                    timeout=TRANSLATE_TIMEOUT
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("translatedText", text)
+        except Exception as e:
+            logger.error(f"Translation failed: {e}")
         
-        if last_exception:
-            logger.error(f"Translation failed: {last_exception}")
         return text
 
     @classmethod
     async def translate_batch_async(cls, texts: List[str], target_lang: str) -> List[str]:
-        """Translates multiple texts in batches using a context-aware joining strategy."""
+        """Translates multiple texts in batches using delimiter-based strategy optimized for Chinese drama."""
         if TRANSLATE_PROVIDER == "off" or not texts:
             return texts
             
         results = []
-        batch_size = 8 
+        # Increased batch size for better context in drama dialogue
+        # Chinese dramas often have continuous conversations that need context
+        batch_size = 15
+        
+        # Special delimiter that's unlikely to appear in Chinese text
+        # and won't be translated by Google Translate
+        DELIMITER = " ||| "
         
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             
-            # Using numeric markers helps Google Translate maintain context 
-            # while keeping segments separable. e.g. "1. Teks... 2. Teks..."
-            joined_text = "\n".join([f"{idx+1}. {txt}" for idx, txt in enumerate(batch)])
+            # Join with delimiter instead of numbering to preserve natural flow
+            # This helps Google Translate understand dialogue context better
+            joined_text = DELIMITER.join(batch)
             
             try:
                 if TRANSLATE_PROVIDER == "google":
@@ -131,26 +126,35 @@ class TranslationManager:
                         timeout=TRANSLATE_TIMEOUT + (len(batch) * 0.5)
                     )
                     
-                    # Split back and remove numbering
-                    # We look for "1. ", "2. ", etc.
-                    parts = []
-                    for idx in range(len(batch)):
-                        pattern = rf"(?m)^{idx+1}[\.\)\-]?\s*(.*)"
-                        match = re.search(pattern, translated_joined)
-                        if match:
-                            parts.append(match.group(1).strip())
-                        else:
-                            # Fallback if numbering was messed up by translator
-                            parts.append("") 
-
-                    # If length matches, great. If not, fallback to individual.
-                    if len(parts) == len(batch) and all(parts):
+                    # Split back using the delimiter
+                    parts = translated_joined.split(DELIMITER)
+                    
+                    # Clean up parts (remove extra whitespace)
+                    parts = [p.strip() for p in parts]
+                    
+                    # Validate: should have same number of parts as batch
+                    if len(parts) == len(batch):
                         results.extend(parts)
                     else:
-                        logger.warning(f"Batch recovery failed for index {i}. Falling back to individual.")
-                        for txt in batch:
-                            results.append(cls._sync_translate(txt, target_lang))
+                        # If split count doesn't match, try to recover
+                        logger.warning(f"Batch split mismatch: expected {len(batch)}, got {len(parts)}. Attempting recovery.")
+                        
+                        # Try alternative delimiters that might have been translated
+                        for alt_delim in [" | ", "|", "|||"]:
+                            alt_parts = translated_joined.split(alt_delim)
+                            if len(alt_parts) == len(batch):
+                                logger.info(f"Recovered using alternative delimiter: '{alt_delim}'")
+                                results.extend([p.strip() for p in alt_parts])
+                                break
+                        else:
+                            # Last resort: fallback to individual but log for monitoring
+                            logger.error(f"Batch recovery failed completely. Falling back to individual translation.")
+                            individual_results = []
+                            for txt in batch:
+                                individual_results.append(cls._sync_translate(txt, target_lang))
+                            results.extend(individual_results)
                 else:
+                    # LibreTranslate or other providers: individual translation
                     for txt in batch:
                         results.append(cls._sync_translate(txt, target_lang))
             except Exception as e:
@@ -165,16 +169,16 @@ def is_valid_segment(s) -> bool:
     if not text: 
         return False
     
-    # Lenient check for single-character languages (Chinese, etc)
-    if len(text) < 1: 
+    # Minimum 2 characters for Chinese to avoid single-char noise
+    if len(text) < 2: 
         return False
     
-    # Balanced thresholds to avoid noise/hallucinations (REFINED)
-    if s.no_speech_prob > 0.995: # Was 0.995, back to slightly more strict
+    # STRICTER thresholds to reduce hallucinations
+    if s.no_speech_prob > 0.85:  # Much stricter - reject likely non-speech
         return False 
-    if s.avg_logprob < -2.5:    # Was -2.0, back to slightly more strict
+    if s.avg_logprob < -1.0:     # Much stricter - reject low confidence
         return False
-    if (s.end - s.start) < 0.15: # Was 0.1, back to 0.2
+    if (s.end - s.start) < 0.3:  # Longer minimum - reject very short segments
         return False
     return True
 
@@ -187,7 +191,7 @@ def format_timestamp(seconds: float) -> str:
 
 
 
-def regroup_by_words(segments, max_chars=40, max_dur=2.5, max_gap=0.6):
+def regroup_by_words(segments, max_chars=35, max_dur=2.0, max_gap=0.4):
     new_segments = []
     current_words = []
     current_len = 0
@@ -266,9 +270,8 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
     if not valid_raw_segments: return {}
 
     # 1. Regroup based on Words (Natural Flow) - Done ONCE
-    # Reduced max_chars to 25 to be more subtitle-friendly for Chinese source
-    # Adjusted max_gap to 0.7 for more natural speaker/phrase breaks
-    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=25, max_dur=3.0, max_gap=0.7)
+    # Optimized for Chinese: shorter chars, tighter timing for better sync
+    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=30, max_dur=2.5, max_gap=0.4)
     logger.info(f"Regrouped into {len(processed_data_template)} natural segments.")
 
     results = {}
@@ -285,14 +288,15 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
 
         # 3. Smart Duration Enforcement (Readability Fix)
         final_segments = []
-        min_duration = 1.5 
+        min_duration = 0.8  # Reduced for better sync - don't force long display
 
         for i, s in enumerate(processed_data):
             next_start = processed_data[i+1]["start"] if i < len(processed_data) - 1 else float('inf')
             current_dur = s["end"] - s["start"]
-            available_room = max(0, (next_start - 0.1) - s["end"])
+            available_room = max(0, (next_start - 0.2) - s["end"])  # More gap before next
             
-            if current_dur < min_duration:
+            # Only extend if VERY short and there's room
+            if current_dur < min_duration and available_room > 0.3:
                 needed = min_duration - current_dur
                 s["end"] += min(needed, available_room)
                 
@@ -345,12 +349,12 @@ async def transcribe(
                 beam_size=5,   # Increased for better Chinese recognition
                 temperature=0,
                 word_timestamps=True, # Improves sync accuracy significantly
-                vad_filter=False,
+                vad_filter=True,  # ENABLED - critical for reducing hallucinations
                 vad_parameters=dict(
-                    min_silence_duration_ms=1000, # Back to 1s, 3s was too long
-                    speech_pad_ms=500, # Balanced padding
-                    threshold=0.35
-                ) # Optimized Sensitive VAD
+                    min_silence_duration_ms=500,  # Shorter - more responsive
+                    speech_pad_ms=300,  # Less padding - tighter timing
+                    threshold=0.5  # Higher threshold - less sensitive to noise
+                )
             )
             raw_segments = list(segments_gen)
             source_lang = info.language
