@@ -72,97 +72,277 @@ whisper_lock = asyncio.Lock()
 
 
 class TranslationManager:
+    """
+    Subtitle Reliability Translation Manager
+    
+    HARD RULES (NEVER VIOLATED):
+    1. Subtitles must NEVER be empty. Empty subtitle = fatal bug.
+    2. Batch translation ONLY for short texts (<80 characters).
+    3. Segments >120 chars MUST be split by Chinese punctuation before translation.
+    4. Empty/short results trigger individual retry.
+    5. Final fallback is ALWAYS original zh-CN text.
+    6. Never trust batch output length, delimiters, or ordering.
+    7. Determinism > Performance.
+    """
+    
+    # Chinese sentence-ending punctuation for safe splitting
+    CHINESE_PUNCTUATION = re.compile(r'([，。！？；：、])')
+    
     @staticmethod
-    def _sync_translate(text: str, target_lang: str) -> str:
-        """Blocking translation call. Forcing source='zh-CN' for Dracin context."""
+    def split_long_text(text: str, max_length: int = 120) -> List[str]:
+        """
+        Split long Chinese text by punctuation for safe translation.
+        
+        RULE: Segments >120 chars MUST be split before translation.
+        Returns list of chunks, each ending at natural punctuation boundary.
+        """
         text = text.strip()
-        if not text: return text
+        if not text:
+            return []
         
-        try:
-            if TRANSLATE_PROVIDER == "google":
-                # Force zh-CN to avoid auto-detection failure
-                # Single attempt - no retry to avoid inconsistency
-                result = GoogleTranslator(source="zh-CN", target=target_lang).translate(text)
-                return result if result else text
-            elif TRANSLATE_PROVIDER == "libre":
-                resp = requests.post(
-                    LIBRE_TRANSLATE_URL,
-                    json={"q": text, "source": "zh", "target": target_lang, "format": "text"},
-                    timeout=TRANSLATE_TIMEOUT
-                )
-                if resp.status_code == 200:
-                    return resp.json().get("translatedText", text)
-        except Exception as e:
-            logger.error(f"Translation failed: {e}")
+        # If short enough, return as-is
+        if len(text) <= max_length:
+            return [text]
         
-        return text
-
-    @classmethod
-    async def translate_batch_async(cls, texts: List[str], target_lang: str) -> List[str]:
-        """Translates multiple texts in batches using delimiter-based strategy optimized for Chinese drama."""
-        if TRANSLATE_PROVIDER == "off" or not texts:
-            return texts
+        chunks = []
+        current_chunk = ""
+        
+        # Split by Chinese punctuation while preserving it
+        parts = TranslationManager.CHINESE_PUNCTUATION.split(text)
+        
+        # Check if we actually have punctuation (split produces >1 part)
+        has_punctuation = len(parts) > 1
+        
+        if has_punctuation:
+            # Use punctuation-based splitting
+            for part in parts:
+                if not part:
+                    continue
+                    
+                # If adding this part would exceed limit and we have content, save chunk
+                if current_chunk and len(current_chunk + part) > max_length:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = part
+                else:
+                    current_chunk += part
             
-        results = []
-        # Increased batch size for better context in drama dialogue
-        # Chinese dramas often have continuous conversations that need context
-        batch_size = 15
+            # Add remaining chunk
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+        else:
+            # No punctuation found - fallback to character-based splitting
+            logger.warning(f"No punctuation found in long text, using character-based split")
+            for i in range(0, len(text), max_length):
+                chunk = text[i:i + max_length]
+                if chunk.strip():
+                    chunks.append(chunk.strip())
         
-        # Special delimiter that's unlikely to appear in Chinese text
-        # and won't be translated by Google Translate
-        DELIMITER = " ||| "
+        # Safety: if no chunks created (shouldn't happen), return original
+        if not chunks:
+            logger.warning(f"split_long_text failed to create chunks, returning original text")
+            return [text]
         
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            
-            # Join with delimiter instead of numbering to preserve natural flow
-            # This helps Google Translate understand dialogue context better
-            joined_text = DELIMITER.join(batch)
-            
+        logger.info(f"Split text ({len(text)} chars) into {len(chunks)} chunks")
+        return chunks
+    
+    @staticmethod
+    def _sync_translate_safe(text: str, target_lang: str, retry_count: int = 2) -> str:
+        """
+        Safe blocking translation with empty-result detection and retry.
+        
+        RULE: If result is empty or suspiciously short, retry individually.
+        RULE: Final fallback is ALWAYS original text.
+        """
+        text = text.strip()
+        if not text:
+            return text
+        
+        original_text = text
+        min_expected_length = max(1, len(text) // 10)  # Expect at least 10% of original length
+        
+        for attempt in range(retry_count):
             try:
                 if TRANSLATE_PROVIDER == "google":
+                    result = GoogleTranslator(source="zh-CN", target=target_lang).translate(text)
+                    
+                    # CRITICAL: Validate result is not empty or suspiciously short
+                    if result and len(result.strip()) >= min_expected_length:
+                        return result.strip()
+                    else:
+                        logger.warning(f"Translation attempt {attempt+1} returned empty/short result for: {text[:50]}...")
+                        
+                elif TRANSLATE_PROVIDER == "libre":
+                    resp = requests.post(
+                        LIBRE_TRANSLATE_URL,
+                        json={"q": text, "source": "zh", "target": target_lang, "format": "text"},
+                        timeout=TRANSLATE_TIMEOUT
+                    )
+                    if resp.status_code == 200:
+                        result = resp.json().get("translatedText", "")
+                        if result and len(result.strip()) >= min_expected_length:
+                            return result.strip()
+                        else:
+                            logger.warning(f"LibreTranslate returned empty/short result")
+                            
+            except Exception as e:
+                logger.error(f"Translation attempt {attempt+1} failed: {e}")
+        
+        # FINAL FALLBACK: Return original text (NEVER empty)
+        logger.warning(f"All translation attempts failed, returning original: {original_text[:50]}...")
+        return original_text
+    
+    @classmethod
+    async def safe_translate(cls, text: str, target_lang: str) -> str:
+        """
+        Async wrapper for safe translation with text splitting.
+        
+        RULE: Long text (>120 chars) is split before translation.
+        RULE: Result is NEVER empty.
+        """
+        text = text.strip()
+        if not text:
+            return text
+        
+        # Split long text by punctuation
+        chunks = cls.split_long_text(text, max_length=120)
+        
+        if len(chunks) == 1:
+            # Short text - translate directly
+            return await asyncio.to_thread(cls._sync_translate_safe, chunks[0], target_lang)
+        else:
+            # Long text - translate chunks individually and rejoin
+            translated_chunks = []
+            for chunk in chunks:
+                translated = await asyncio.to_thread(cls._sync_translate_safe, chunk, target_lang)
+                translated_chunks.append(translated)
+            
+            result = " ".join(translated_chunks)
+            
+            # SAFETY: Ensure result is not empty
+            if not result.strip():
+                logger.error(f"Chunk translation resulted in empty string, returning original")
+                return text
+            
+            return result.strip()
+    
+    @classmethod
+    async def translate_batch_async(cls, texts: List[str], target_lang: str) -> List[str]:
+        """
+        Batch translation with strict 1:1 mapping validation.
+        
+        RULES:
+        - Batch ONLY for short texts (<80 chars)
+        - Long texts (>80 chars) translated individually
+        - Strict validation: input count MUST equal output count
+        - Empty results trigger individual retry
+        - Never trust delimiter-based splitting
+        """
+        if TRANSLATE_PROVIDER == "off" or not texts:
+            return texts
+        
+        results = []
+        
+        # Separate short and long texts
+        short_texts = []
+        short_indices = []
+        long_texts = []
+        long_indices = []
+        
+        for i, text in enumerate(texts):
+            text_len = len(text.strip())
+            if text_len == 0:
+                # Empty text - keep as-is
+                results.append("")
+            elif text_len < 80:
+                # Short text - can batch
+                short_texts.append(text)
+                short_indices.append(i)
+            else:
+                # Long text - must translate individually
+                long_texts.append(text)
+                long_indices.append(i)
+        
+        # Initialize results array with None placeholders
+        final_results = [None] * len(texts)
+        
+        # Handle long texts individually (RULE: >80 chars = individual)
+        logger.info(f"Translating {len(long_texts)} long texts individually")
+        for text, idx in zip(long_texts, long_indices):
+            translated = await cls.safe_translate(text, target_lang)
+            final_results[idx] = translated
+        
+        # Handle short texts in small batches
+        if short_texts:
+            logger.info(f"Translating {len(short_texts)} short texts in batches")
+            batch_size = 10  # Smaller batch for reliability
+            
+            for i in range(0, len(short_texts), batch_size):
+                batch = short_texts[i:i + batch_size]
+                batch_indices = short_indices[i:i + batch_size]
+                
+                # Try batch translation with delimiter
+                DELIMITER = " ||| "
+                joined_text = DELIMITER.join(batch)
+                
+                try:
                     translated_joined = await asyncio.wait_for(
-                        asyncio.to_thread(cls._sync_translate, joined_text, target_lang),
+                        asyncio.to_thread(cls._sync_translate_safe, joined_text, target_lang),
                         timeout=TRANSLATE_TIMEOUT + (len(batch) * 0.5)
                     )
                     
-                    # Split back using the delimiter
                     parts = translated_joined.split(DELIMITER)
-                    
-                    # Clean up parts (remove extra whitespace)
                     parts = [p.strip() for p in parts]
                     
-                    # Validate: should have same number of parts as batch
+                    # STRICT VALIDATION: Count must match
                     if len(parts) == len(batch):
-                        results.extend(parts)
-                    else:
-                        # If split count doesn't match, try to recover
-                        logger.warning(f"Batch split mismatch: expected {len(batch)}, got {len(parts)}. Attempting recovery.")
-                        
-                        # Try alternative delimiters that might have been translated
-                        for alt_delim in [" | ", "|", "|||"]:
-                            alt_parts = translated_joined.split(alt_delim)
-                            if len(alt_parts) == len(batch):
-                                logger.info(f"Recovered using alternative delimiter: '{alt_delim}'")
-                                results.extend([p.strip() for p in alt_parts])
+                        # Validate no empty results
+                        valid = True
+                        for j, part in enumerate(parts):
+                            if not part or len(part) < 1:
+                                logger.warning(f"Batch result {j} is empty, invalidating batch")
+                                valid = False
                                 break
+                        
+                        if valid:
+                            # Success - use batch results
+                            for j, (part, idx) in enumerate(zip(parts, batch_indices)):
+                                final_results[idx] = part
                         else:
-                            # Last resort: fallback to individual but log for monitoring
-                            logger.error(f"Batch recovery failed completely. Falling back to individual translation.")
-                            individual_results = []
-                            for txt in batch:
-                                individual_results.append(cls._sync_translate(txt, target_lang))
-                            results.extend(individual_results)
-                else:
-                    # LibreTranslate or other providers: individual translation
-                    for txt in batch:
-                        results.append(cls._sync_translate(txt, target_lang))
-            except Exception as e:
-                logger.error(f"Batch translation error: {e}. Falling back to individual.")
-                for txt in batch:
-                    results.append(cls._sync_translate(txt, target_lang))
-                
-        return results
+                            # Empty results detected - retry individually
+                            logger.warning(f"Empty results in batch, retrying individually")
+                            for text, idx in zip(batch, batch_indices):
+                                translated = await cls.safe_translate(text, target_lang)
+                                final_results[idx] = translated
+                    else:
+                        # Count mismatch - retry individually
+                        logger.warning(f"Batch count mismatch: expected {len(batch)}, got {len(parts)}. Retrying individually.")
+                        for text, idx in zip(batch, batch_indices):
+                            translated = await cls.safe_translate(text, target_lang)
+                            final_results[idx] = translated
+                            
+                except Exception as e:
+                    logger.error(f"Batch translation error: {e}. Falling back to individual.")
+                    for text, idx in zip(batch, batch_indices):
+                        translated = await cls.safe_translate(text, target_lang)
+                        final_results[idx] = translated
+        
+        # FINAL VALIDATION: Ensure 1:1 mapping and no None values
+        for i, result in enumerate(final_results):
+            if result is None:
+                logger.error(f"Result {i} is None! Using original text as fallback.")
+                final_results[i] = texts[i]
+            elif not result.strip():
+                logger.error(f"Result {i} is empty! Using original text as fallback.")
+                final_results[i] = texts[i]
+        
+        # STRICT CHECK: Output count MUST equal input count
+        if len(final_results) != len(texts):
+            logger.critical(f"FATAL: Output count ({len(final_results)}) != Input count ({len(texts)})")
+            # Emergency fallback: return original texts
+            return texts
+        
+        logger.info(f"Successfully translated {len(texts)} texts with 1:1 mapping")
+        return final_results
 
 def is_valid_segment(s) -> bool:
     text = s.text.strip()
@@ -281,9 +461,23 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
         # 2. Translate the NEW segments
         if needs_translation:
             texts_to_translate = [item["text"] for item in processed_data]
+            original_texts = texts_to_translate[:]  # Keep backup for safety
+            
             translated_texts = await TranslationManager.translate_batch_async(texts_to_translate, lang)
+            
+            # CRITICAL VALIDATION: Ensure 1:1 mapping and no empty subtitles
+            if len(translated_texts) != len(texts_to_translate):
+                logger.critical(f"FATAL: Translation count mismatch! Expected {len(texts_to_translate)}, got {len(translated_texts)}")
+                # Emergency: use original texts
+                translated_texts = original_texts
+            
             for i, translated in enumerate(translated_texts):
-                processed_data[i]["text"] = translated
+                # RULE: Subtitles must NEVER be empty
+                if not translated or not translated.strip():
+                    logger.error(f"Empty subtitle detected at index {i}! Using original text: {original_texts[i][:50]}...")
+                    processed_data[i]["text"] = original_texts[i]
+                else:
+                    processed_data[i]["text"] = translated
 
         # 3. Smart Duration Enforcement (Readability Fix)
         final_segments = []
