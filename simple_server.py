@@ -349,11 +349,11 @@ def is_valid_segment(s) -> bool:
     if not text: 
         return False
     
-    if len(text) < 2 and not HAN_RE.search(text):
+    if len(text) < 1 and not HAN_RE.search(text):
         return False
     
     # STRICTER thresholds to reduce hallucinations
-   if s.no_speech_prob > 0.92:
+    if s.no_speech_prob > 0.92:
         return False
 
     if s.avg_logprob < -1.4:
@@ -551,7 +551,7 @@ async def transcribe(
                 task="transcribe",
                 language="zh", # Force source language to Chinese
                 initial_prompt=DRACIN_PROMPT,
-                beam_size=5,   # Increased for better Chinese recognition
+                beam_size=7,   # Increased for better Chinese recognition
                 temperature=0,
                 word_timestamps=True, # Improves sync accuracy significantly
                 vad_filter=True,  # ENABLED - critical for reducing hallucinations
