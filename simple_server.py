@@ -567,7 +567,7 @@ async def transcribe(
                 task="transcribe",
                 language="zh", # Force source language to Chinese
                 initial_prompt=DRACIN_PROMPT,
-                beam_size=5,   # Increased for better Chinese recognition
+                beam_size=7,   # Increased for better Chinese recognition
                 temperature=0,
                 word_timestamps=True, # Improves sync accuracy significantly
                 vad_filter=True,  # ENABLED - critical for reducing hallucinations
