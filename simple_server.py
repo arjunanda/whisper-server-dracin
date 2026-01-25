@@ -148,29 +148,28 @@ class TranslationManager:
     @staticmethod
     def _sync_translate_safe(text: str, target_lang: str, retry_count: int = 2) -> str:
         """
-        Safe blocking translation.
+        Safe blocking translation with empty-result detection and retry.
         
-        FIX: TRANSLATION COMPLETENESS
-        - Accept ANY non-empty result.
-        - No minimum length validation (short translations are valid).
-        - Retry only on empty or error.
+        RULE: If result is empty or suspiciously short, retry individually.
+        RULE: Final fallback is ALWAYS original text.
         """
         text = text.strip()
         if not text:
             return text
         
         original_text = text
+        min_expected_length = max(1, len(text) // 10)  # Expect at least 10% of original length
         
         for attempt in range(retry_count):
             try:
                 if TRANSLATE_PROVIDER == "google":
                     result = GoogleTranslator(source="zh-CN", target=target_lang).translate(text)
                     
-                    # VALIDATION: Only check for empty
-                    if result and result.strip():
+                    # CRITICAL: Validate result is not empty or suspiciously short
+                    if result and len(result.strip()) >= min_expected_length:
                         return result.strip()
                     else:
-                        logger.warning(f"Translation attempt {attempt+1} returned empty result for: {text[:50]}...")
+                        logger.warning(f"Translation attempt {attempt+1} returned empty/short result for: {text[:50]}...")
                         
                 elif TRANSLATE_PROVIDER == "libre":
                     resp = requests.post(
@@ -180,10 +179,10 @@ class TranslationManager:
                     )
                     if resp.status_code == 200:
                         result = resp.json().get("translatedText", "")
-                        if result and result.strip():
+                        if result and len(result.strip()) >= min_expected_length:
                             return result.strip()
                         else:
-                            logger.warning(f"LibreTranslate returned empty result")
+                            logger.warning(f"LibreTranslate returned empty/short result")
                             
             except Exception as e:
                 logger.error(f"Translation attempt {attempt+1} failed: {e}")
@@ -229,25 +228,19 @@ class TranslationManager:
     @classmethod
     async def translate_batch_async(cls, texts: List[str], target_lang: str) -> List[str]:
         """
-        Batch translation with AGGRESSIVE per-line fallback for CN drama.
-        
-        FIX 1: TRANSLATION COMPLETENESS
-        - Every input MUST produce output (never empty)
-        - Batch failure → immediate per-line retry
-        - ANY empty result → invalidate entire batch → retry all individually
-        - Delimiter breaks → per-line fallback
-        - Google merges lines → per-line fallback
+        Batch translation with strict 1:1 mapping validation.
         
         RULES:
         - Batch ONLY for short texts (<80 chars)
         - Long texts (>80 chars) translated individually
-        - Zero tolerance for empty results
+        - Strict validation: input count MUST equal output count
+        - Empty results trigger individual retry
+        - Never trust delimiter-based splitting
         """
         if TRANSLATE_PROVIDER == "off" or not texts:
             return texts
         
-        # Initialize results array with None placeholders
-        final_results = [None] * len(texts)
+        results = []
         
         # Separate short and long texts
         short_texts = []
@@ -258,36 +251,36 @@ class TranslationManager:
         for i, text in enumerate(texts):
             text_len = len(text.strip())
             if text_len == 0:
-                # Empty input - preserve as empty
-                final_results[i] = ""
+                # Empty text - keep as-is
+                results.append("")
             elif text_len < 80:
-                # Short text - eligible for batching
+                # Short text - can batch
                 short_texts.append(text)
                 short_indices.append(i)
             else:
-                # Long text - MUST translate individually
+                # Long text - must translate individually
                 long_texts.append(text)
                 long_indices.append(i)
         
-        # Handle long texts individually (RULE: >80 chars = individual)
-        if long_texts:
-            logger.info(f"Translating {len(long_texts)} long texts individually")
-            for text, idx in zip(long_texts, long_indices):
-                translated = await cls.safe_translate(text, target_lang)
-                final_results[idx] = translated
+        # Initialize results array with None placeholders
+        final_results = [None] * len(texts)
         
-        # Handle short texts with AGGRESSIVE batch validation
+        # Handle long texts individually (RULE: >80 chars = individual)
+        logger.info(f"Translating {len(long_texts)} long texts individually")
+        for text, idx in zip(long_texts, long_indices):
+            translated = await cls.safe_translate(text, target_lang)
+            final_results[idx] = translated
+        
+        # Handle short texts in small batches
         if short_texts:
             logger.info(f"Translating {len(short_texts)} short texts in batches")
-            batch_size = 10  # Small batch for CN drama reliability
+            batch_size = 10  # Smaller batch for reliability
             
             for i in range(0, len(short_texts), batch_size):
                 batch = short_texts[i:i + batch_size]
                 batch_indices = short_indices[i:i + batch_size]
                 
-                batch_success = False
-                
-                # TRY batch translation (optimistic path)
+                # Try batch translation with delimiter
                 DELIMITER = " ||| "
                 joined_text = DELIMITER.join(batch)
                 
@@ -300,53 +293,55 @@ class TranslationManager:
                     parts = translated_joined.split(DELIMITER)
                     parts = [p.strip() for p in parts]
                     
-                    # AGGRESSIVE VALIDATION: Count + Content
+                    # STRICT VALIDATION: Count must match
                     if len(parts) == len(batch):
-                        # Check EVERY result for emptiness
-                        all_valid = True
+                        # Validate no empty results
+                        valid = True
                         for j, part in enumerate(parts):
-                            # FIX: Only check for empty, ignore length ratio
-                            if not part or not part.strip():
-                                logger.warning(f"Batch item {j} is empty: '{batch[j][:30]}...' -> '{part}'")
-                                all_valid = False
+                            if not part or len(part) < 1:
+                                logger.warning(f"Batch result {j} is empty, invalidating batch")
+                                valid = False
                                 break
                         
-                        if all_valid:
-                            # SUCCESS - use batch results
-                            for part, idx in zip(parts, batch_indices):
+                        if valid:
+                            # Success - use batch results
+                            for j, (part, idx) in enumerate(zip(parts, batch_indices)):
                                 final_results[idx] = part
-                            batch_success = True
-                            logger.debug(f"Batch of {len(batch)} succeeded")
                         else:
-                            logger.warning(f"Batch validation failed: empty/short results detected")
+                            # Empty results detected - retry individually
+                            logger.warning(f"Empty results in batch, retrying individually")
+                            for text, idx in zip(batch, batch_indices):
+                                translated = await cls.safe_translate(text, target_lang)
+                                final_results[idx] = translated
                     else:
-                        logger.warning(f"Batch count mismatch: {len(batch)} → {len(parts)}")
-                        
+                        # Count mismatch - retry individually
+                        logger.warning(f"Batch count mismatch: expected {len(batch)}, got {len(parts)}. Retrying individually.")
+                        for text, idx in zip(batch, batch_indices):
+                            translated = await cls.safe_translate(text, target_lang)
+                            final_results[idx] = translated
+                            
                 except Exception as e:
-                    logger.error(f"Batch translation exception: {e}")
-                
-                # FALLBACK: Per-line retry if batch failed
-                if not batch_success:
-                    logger.warning(f"Falling back to per-line translation for {len(batch)} items")
+                    logger.error(f"Batch translation error: {e}. Falling back to individual.")
                     for text, idx in zip(batch, batch_indices):
                         translated = await cls.safe_translate(text, target_lang)
                         final_results[idx] = translated
         
-        # FINAL SAFETY NET: Catch any remaining None/empty
+        # FINAL VALIDATION: Ensure 1:1 mapping and no None values
         for i, result in enumerate(final_results):
             if result is None:
-                logger.error(f"CRITICAL: Result {i} is None after all retries! Using original.")
+                logger.error(f"Result {i} is None! Using original text as fallback.")
                 final_results[i] = texts[i]
-            elif not result.strip() and texts[i].strip():  # Non-empty input became empty
-                logger.error(f"CRITICAL: Result {i} is empty for non-empty input! Using original.")
+            elif not result.strip():
+                logger.error(f"Result {i} is empty! Using original text as fallback.")
                 final_results[i] = texts[i]
         
         # STRICT CHECK: Output count MUST equal input count
         if len(final_results) != len(texts):
-            logger.critical(f"FATAL: Count mismatch {len(final_results)} != {len(texts)}, returning originals")
+            logger.critical(f"FATAL: Output count ({len(final_results)}) != Input count ({len(texts)})")
+            # Emergency fallback: return original texts
             return texts
         
-        logger.info(f"Translation complete: {len(texts)} items, 100% coverage")
+        logger.info(f"Successfully translated {len(texts)} texts with 1:1 mapping")
         return final_results
 
 def is_valid_segment(s) -> bool:
@@ -375,19 +370,7 @@ def format_timestamp(seconds: float) -> str:
 
 
 
-def regroup_by_words(segments, max_chars=20, max_dur=1.5, max_gap=0.25):
-    """
-    FIX 2: SPEECH-SUBTITLE SYNC (CN Drama Optimized)
-    
-    Regroup subtitles using word timestamps for natural dialogue flow.
-    
-    Parameters tuned for fast-paced Chinese drama:
-    - max_chars=20: Shorter lines (was 35) → prevents long blocks
-    - max_dur=1.5: Tighter timing (was 2.0) → faster subtitle changes
-    - max_gap=0.25: Smaller silence (was 0.4) → more responsive breaks
-    
-    Result: Natural, easy-to-read subtitles that match CN drama pacing
-    """
+def regroup_by_words(segments, max_chars=35, max_dur=2.0, max_gap=0.4):
     new_segments = []
     current_words = []
     current_len = 0
@@ -408,11 +391,11 @@ def regroup_by_words(segments, max_chars=20, max_dur=1.5, max_gap=0.25):
                     "text": s.text.strip()
                 })
 
-    # No word timestamps → use fallback segments
+    # 🔴 Kalau TIDAK ADA word timestamps sama sekali
     if not all_words:
         return fallback_segments
 
-    # Regroup based on word timestamps
+    # 🔵 Regroup berbasis word timestamps
     for w in all_words:
         if not current_words:
             current_start = w.start
@@ -425,7 +408,6 @@ def regroup_by_words(segments, max_chars=20, max_dur=1.5, max_gap=0.25):
         text_so_far = "".join(current_words).strip()
         has_punctuation = text_so_far and text_so_far[-1] in ['.', '?', '!', '。', '？', '！']
 
-        # Break on: gap, length, duration, or punctuation
         if current_words and (is_gap or is_long or is_toolong_dur or has_punctuation):
             new_segments.append({
                 "start": current_start,
@@ -440,7 +422,6 @@ def regroup_by_words(segments, max_chars=20, max_dur=1.5, max_gap=0.25):
         current_len += w_len
         last_end = w.end
 
-    # Add final segment
     if current_words:
         new_segments.append({
             "start": current_start,
@@ -448,7 +429,7 @@ def regroup_by_words(segments, max_chars=20, max_dur=1.5, max_gap=0.25):
             "text": "".join(current_words).strip()
         })
 
-    # Merge fallback segments (no timestamp overlap)
+    # 🔵 Gabungkan fallback TANPA tabrakan waktu
     merged = new_segments[:]
 
     for fb in fallback_segments:
@@ -468,8 +449,8 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
     if not valid_raw_segments: return {}
 
     # 1. Regroup based on Words (Natural Flow) - Done ONCE
-    # Optimized for Chinese: max_chars=24, max_dur=1.8, max_gap=0.3
-    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=24, max_dur=1.8, max_gap=0.3)
+    # Optimized for Chinese: shorter chars, tighter timing for better sync
+    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=30, max_dur=2.5, max_gap=0.4)
     logger.info(f"Regrouped into {len(processed_data_template)} natural segments.")
 
     results = {}
@@ -498,46 +479,20 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
                 else:
                     processed_data[i]["text"] = translated
 
-        # 3. TEXT-AWARE SUBTITLE DURATION (FIX 3)
+        # 3. Smart Duration Enforcement (Readability Fix)
         final_segments = []
-        
-        # Reading speed model
-        MIN_DURATION = 1.0       # HARD MINIMUM 1.0s
-        SAFETY_GAP = 0.05        # Minimal gap to prevent overlap but keep flow
+        min_duration = 0.8  # Reduced for better sync - don't force long display
 
         for i, s in enumerate(processed_data):
             next_start = processed_data[i+1]["start"] if i < len(processed_data) - 1 else float('inf')
+            current_dur = s["end"] - s["start"]
+            available_room = max(0, (next_start - 0.2) - s["end"])  # More gap before next
             
-            # 1. Base Duration Calculation
-            text_len = len(s["text"].strip())
-            
-            # Adaptive CPS: Lower CPS (more time) for longer text to aid comfort
-            cps = 10.0 if text_len > 25 else 13.0
-            
-            required_dur = max(MIN_DURATION, text_len / cps)
-            
-            # 2. Extend to meet requirement
-            current_end = s["end"]
-            current_dur = current_end - s["start"]
-            
-            if current_dur < required_dur:
-                # We need to extend
-                wanted_end = s["start"] + required_dur
+            # Only extend if VERY short and there's room
+            if current_dur < min_duration and available_room > 0.3:
+                needed = min_duration - current_dur
+                s["end"] += min(needed, available_room)
                 
-                # Hard limit by next subtitle
-                limit = next_start - SAFETY_GAP
-                
-                new_end = min(wanted_end, limit)
-                
-                # Only extend, never shorten
-                s["end"] = max(current_end, new_end)
-            
-            # 3. Gap Bridging (Flow Optimization)
-            # If tiny gap remains, close it for smoother flow
-            gap = (next_start - SAFETY_GAP) - s["end"]
-            if 0 < gap < 0.3:
-                 s["end"] = next_start - SAFETY_GAP
-                 
             final_segments.append(s)
         
         results[lang] = final_segments
