@@ -349,16 +349,14 @@ def is_valid_segment(s) -> bool:
     if not text: 
         return False
     
-    if len(text) < 1 and not HAN_RE.search(text):
+    if len(text) == 1 and not HAN_RE.search(text):
         return False
-    
+
     # STRICTER thresholds to reduce hallucinations
     if s.no_speech_prob > 0.92:
         return False
-
     if s.avg_logprob < -1.4:
         return False
-
     if (s.end - s.start) < 0.2:
         return False
     return True
@@ -419,6 +417,18 @@ def regroup_by_words(segments, max_chars=35, max_dur=2.0, max_gap=0.4):
             current_words = []
             current_len = 0
             current_start = w.start
+
+        if current_words:
+            prev_word = current_words[-1]
+            if w.word == prev_word:
+                # skip exact repetition
+                last_end = max(last_end, w.end)
+                continue
+
+        # skip overlapping timestamps
+        if w.start < last_end - 0.05:
+            last_end = max(last_end, w.end)
+            continue
 
         current_words.append(w.word)
         current_len += w_len
@@ -481,6 +491,28 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
                 else:
                     processed_data[i]["text"] = translated
 
+        # 2.5 DEDUPLICATION (Fix for "Cium aku" loops)
+        deduped_data = []
+        for s in processed_data:
+            if not deduped_data:
+                deduped_data.append(s)
+                continue
+                
+            prev = deduped_data[-1]
+            
+            # Check for identical text
+            if prev["text"].strip() == s["text"].strip():
+                 # Merge if gap is small (< 1.0s) - likely a hallucination loop or stutter
+                 gap = s["start"] - prev["end"]
+                 if gap < 1.0:
+                      prev["end"] = max(prev["end"], s["end"])
+                      logger.info(f"Merged repetitive segment: '{s['text']}' (gap: {gap:.2f}s)")
+                      continue
+            
+            deduped_data.append(s)
+            
+        processed_data = deduped_data
+
         # 3. Smart Duration Enforcement (Readability Fix)
         final_segments = []
         
@@ -504,6 +536,18 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
             if current_dur < min_duration and available_room > 0.3:
                 needed = min_duration - current_dur
                 s["end"] += min(needed, available_room)
+
+            if s["end"] <= s["start"]:
+                continue
+
+            # CRITICAL: Filter out micro-hallucinations < 0.2s
+            if (s["end"] - s["start"]) < 0.2:
+                logger.info(f"Dropping micro-segment: '{s['text']}' ({s['end']-s['start']:.2f}s)")
+                continue
+
+            # Filter single char segments that are too short
+            if len(s["text"]) <= 1 and (s["end"] - s["start"]) < 0.5:
+                continue
                 
             final_segments.append(s)
         
@@ -555,10 +599,13 @@ async def transcribe(
                 temperature=0,
                 word_timestamps=True, # Improves sync accuracy significantly
                 vad_filter=True,  # ENABLED - critical for reducing hallucinations
+                condition_on_previous_text=False, # CRITICAL: Disabling to prevent loop hallucinations
+                compression_ratio_threshold=2.2, # Stricter threshold for repetitive text
+                no_speech_threshold=0.4, # Lower threshold to catch silence earlier
                 vad_parameters=dict(
                     min_silence_duration_ms=500,  # Shorter - more responsive
                     speech_pad_ms=300,  # Less padding - tighter timing
-                    threshold=0.5  # Higher threshold - less sensitive to noise
+                    threshold=0.35  # Higher threshold - less sensitive to noise
                 )
             )
             raw_segments = list(segments_gen)
