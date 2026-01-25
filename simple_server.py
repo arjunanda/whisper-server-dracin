@@ -510,22 +510,10 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
             
             # 1. Base Duration Calculation
             text_len = len(s["text"].strip())
-
-            if text_len > 30 and (s["end"] - s["start"]) < 1.2:
-                s["end"] = s["start"] + 1.2
             
             # Adaptive CPS: Lower CPS (more time) for longer text to aid comfort
-            cps = 10.0
-
-            if text_len <= 10:
-                cps = 14.0
-            elif text_len <= 20:
-                cps = 11.0
-            elif text_len <= 30:
-                cps = 9.0
-            else:
-                cps = 7.5
-                        
+            cps = 10.0 if text_len > 25 else 13.0
+            
             required_dur = max(MIN_DURATION, text_len / cps)
             
             # 2. Extend to meet requirement
@@ -533,24 +521,22 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
             current_dur = current_end - s["start"]
             
             if current_dur < required_dur:
+                # We need to extend
                 wanted_end = s["start"] + required_dur
-
-                hard_limit = next_start - 0.01 if next_start != float("inf") else s["start"] + required_dur
-
-                new_end = min(wanted_end, hard_limit)
-
-                # HARD MINIMUM DURATION GUARANTEE
-                if new_end < s["start"] + MIN_DURATION:
-                    new_end = min(s["start"] + MIN_DURATION, hard_limit)
-
+                
+                # Hard limit by next subtitle
+                limit = next_start - SAFETY_GAP
+                
+                new_end = min(wanted_end, limit)
+                
                 # Only extend, never shorten
                 s["end"] = max(current_end, new_end)
-
+            
             # 3. Gap Bridging (Flow Optimization)
-            if next_start != float("inf"):
-                gap = (next_start - SAFETY_GAP) - s["end"]
-                if 0 < gap < 0.3:
-                    s["end"] = next_start - SAFETY_GAP
+            # If tiny gap remains, close it for smoother flow
+            gap = (next_start - SAFETY_GAP) - s["end"]
+            if 0 < gap < 0.3:
+                 s["end"] = next_start - SAFETY_GAP
                  
             final_segments.append(s)
         
