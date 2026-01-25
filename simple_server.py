@@ -353,11 +353,13 @@ def is_valid_segment(s) -> bool:
         return False
     
     # STRICTER thresholds to reduce hallucinations
-    if s.no_speech_prob > 0.85:  # Much stricter - reject likely non-speech
-        return False 
-    if s.avg_logprob < -1.0:     # Much stricter - reject low confidence
+   if s.no_speech_prob > 0.92:
         return False
-    if (s.end - s.start) < 0.3:  # Longer minimum - reject very short segments
+
+    if s.avg_logprob < -1.4:
+        return False
+
+    if (s.end - s.start) < 0.2:
         return False
     return True
 
