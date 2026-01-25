@@ -353,11 +353,11 @@ def is_valid_segment(s) -> bool:
         return False
 
     # STRICTER thresholds to reduce hallucinations
-    if s.no_speech_prob > 0.92:
+    if s.no_speech_prob > 0.85: # Stricter (was 0.92)
         return False
-    if s.avg_logprob < -1.4:
+    if s.avg_logprob < -1.0: # Stricter (was -1.4)
         return False
-    if (s.end - s.start) < 0.2:
+    if (s.end - s.start) < 0.25: # Stricter (was 0.2)
         return False
     return True
 
@@ -369,8 +369,10 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02}.{msecs:03}"
 
 
+# Regex for "Single Number" or "Number Number" hallucinations (e.g. "7", "1 7")
+NUMBER_HALLUCINATION_RE = re.compile(r'^[\d\s\.,]+$')
 
-def regroup_by_words(segments, max_chars=35, max_dur=2.0, max_gap=0.4):
+def regroup_by_words(segments, max_chars=45, max_dur=3.5, max_gap=0.5): # Relaxed to allow longer sentences
     new_segments = []
     current_words = []
     current_len = 0
@@ -408,6 +410,7 @@ def regroup_by_words(segments, max_chars=35, max_dur=2.0, max_gap=0.4):
         text_so_far = "".join(current_words).strip()
         has_punctuation = text_so_far and text_so_far[-1] in ['.', '?', '!', '。', '？', '！']
 
+        # Force split if strong punctuation
         if current_words and (is_gap or is_long or is_toolong_dur or has_punctuation):
             new_segments.append({
                 "start": current_start,
@@ -421,7 +424,7 @@ def regroup_by_words(segments, max_chars=35, max_dur=2.0, max_gap=0.4):
         if current_words:
             prev_word = current_words[-1]
             if w.word == prev_word:
-                # skip exact repetition
+                # skip exact repetition (stutter removal)
                 last_end = max(last_end, w.end)
                 continue
 
@@ -458,11 +461,21 @@ def regroup_by_words(segments, max_chars=35, max_dur=2.0, max_gap=0.4):
 
 async def process_segments_for_langs(segments, target_langs: List[str], needs_translation: bool):
     valid_raw_segments = [s for s in segments if is_valid_segment(s)]
-    if not valid_raw_segments: return {}
+    
+    # FILTER: Remove obvious number hallucinations from RAW segments
+    filtered_segments = []
+    for s in valid_raw_segments:
+        # Check if text is just digits/punctuation (e.g. "7", "1.7", "...")
+        if NUMBER_HALLUCINATION_RE.match(s.text.strip()):
+            logger.info(f"Dropping raw number hallucination: '{s.text}'")
+            continue
+        filtered_segments.append(s)
+        
+    if not filtered_segments: return {}
 
     # 1. Regroup based on Words (Natural Flow) - Done ONCE
     # Optimized for Chinese: shorter chars, tighter timing for better sync
-    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=22, max_dur=2.5, max_gap=0.4)
+    processed_data_template = regroup_by_words(filtered_segments, max_chars=35, max_dur=3.0, max_gap=0.5)
     logger.info(f"Regrouped into {len(processed_data_template)} natural segments.")
 
     results = {}
@@ -484,6 +497,9 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
                 translated_texts = original_texts
             
             for i, translated in enumerate(translated_texts):
+                # LOGGING: Trace hallucinations
+                logger.info(f"TRANS [{lang}]: '{original_texts[i]}' -> '{translated}'")
+                
                 # RULE: Subtitles must NEVER be empty
                 if not translated or not translated.strip():
                     logger.error(f"Empty subtitle detected at index {i}! Using original text: {original_texts[i][:50]}...")
@@ -502,9 +518,9 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
             
             # Check for identical text
             if prev["text"].strip() == s["text"].strip():
-                 # Merge if gap is small (< 1.0s) - likely a hallucination loop or stutter
+                 # Merge if gap is small (< 1.5s)
                  gap = s["start"] - prev["end"]
-                 if gap < 1.0:
+                 if gap < 1.5:
                       prev["end"] = max(prev["end"], s["end"])
                       logger.info(f"Merged repetitive segment: '{s['text']}' (gap: {gap:.2f}s)")
                       continue
@@ -523,30 +539,31 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
             available_room = max(0, (next_start - 0.2) - s["end"])  # More gap before next
 
             text_len = len(s["text"].strip())
+            
+            # Remove segments that became empty or just punctuation after translation
+            if len(s["text"]) < 2 and not any(c.isalnum() for c in s["text"]):
+                 continue
 
             # 🔥 PER-SUBTITLE MIN DURATION
             if text_len <= 12:
-                min_duration = 0.7
+                min_duration = 1.0 # Increased min duration for short texts
             elif text_len <= 22:
-                min_duration = 1.0
+                min_duration = 1.5
             else:
-                min_duration = 1.3
+                min_duration = 2.0
             
             # Only extend if VERY short and there's room
-            if current_dur < min_duration and available_room > 0.3:
+            # Aggressively extend short subtitles to improve readability
+            if current_dur < min_duration and available_room > 0.0:
                 needed = min_duration - current_dur
                 s["end"] += min(needed, available_room)
 
             if s["end"] <= s["start"]:
                 continue
 
-            # CRITICAL: Filter out micro-hallucinations < 0.2s
-            if (s["end"] - s["start"]) < 0.2:
-                logger.info(f"Dropping micro-segment: '{s['text']}' ({s['end']-s['start']:.2f}s)")
-                continue
-
-            # Filter single char segments that are too short
-            if len(s["text"]) <= 1 and (s["end"] - s["start"]) < 0.5:
+            # CRITICAL: Filter out micro-hallucinations < 0.25s
+            if (s["end"] - s["start"]) < 0.25:
+                # logger.info(f"Dropping micro-segment: '{s['text']}' ({s['end']-s['start']:.2f}s)")
                 continue
                 
             final_segments.append(s)
@@ -604,8 +621,8 @@ async def transcribe(
                 no_speech_threshold=0.4, # Lower threshold to catch silence earlier
                 vad_parameters=dict(
                     min_silence_duration_ms=500,  # Shorter - more responsive
-                    speech_pad_ms=300,  # Less padding - tighter timing
-                    threshold=0.35  # Higher threshold - less sensitive to noise
+                    speech_pad_ms=200,  # reduced from 300 to 200 for tighter speech
+                    threshold=0.5  # Increased from 0.35 to 0.5 to be stricter
                 )
             )
             raw_segments = list(segments_gen)
