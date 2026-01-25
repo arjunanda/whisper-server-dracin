@@ -481,18 +481,22 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
 
         # 3. Smart Duration Enforcement (Readability Fix)
         final_segments = []
-        text_len = len(s["text"]) 
-        if text_len <= 12: 
-            min_duration = 0.7 
-        elif text_len <= 22: 
-            min_duration = 1.0 
-        else: 
-            min_duration = 1.3
+        
 
         for i, s in enumerate(processed_data):
             next_start = processed_data[i+1]["start"] if i < len(processed_data) - 1 else float('inf')
             current_dur = s["end"] - s["start"]
             available_room = max(0, (next_start - 0.2) - s["end"])  # More gap before next
+
+            text_len = len(s["text"].strip())
+
+            # 🔥 PER-SUBTITLE MIN DURATION
+            if text_len <= 12:
+                min_duration = 0.7
+            elif text_len <= 22:
+                min_duration = 1.0
+            else:
+                min_duration = 1.3
             
             # Only extend if VERY short and there's room
             if current_dur < min_duration and available_room > 0.3:
