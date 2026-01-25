@@ -572,9 +572,9 @@ async def transcribe(
                 word_timestamps=True, # Improves sync accuracy significantly
                 vad_filter=True,  # ENABLED - critical for reducing hallucinations
                 vad_parameters=dict(
-                    min_silence_duration_ms=300,
-                    speech_pad_ms=450,
-                    threshold=0.30
+                    min_silence_duration_ms=500,  # Shorter - more responsive
+                    speech_pad_ms=300,  # Less padding - tighter timing
+                    threshold=0.35  # Higher threshold - less sensitive to noise
                 )
             )
             raw_segments = list(segments_gen)
