@@ -450,7 +450,7 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
 
     # 1. Regroup based on Words (Natural Flow) - Done ONCE
     # Optimized for Chinese: shorter chars, tighter timing for better sync
-    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=30, max_dur=2.5, max_gap=0.4)
+    processed_data_template = regroup_by_words(valid_raw_segments, max_chars=22, max_dur=2.5, max_gap=0.4)
     logger.info(f"Regrouped into {len(processed_data_template)} natural segments.")
 
     results = {}
@@ -481,7 +481,13 @@ async def process_segments_for_langs(segments, target_langs: List[str], needs_tr
 
         # 3. Smart Duration Enforcement (Readability Fix)
         final_segments = []
-        min_duration = 0.8  # Reduced for better sync - don't force long display
+        text_len = len(s["text"]) 
+        if text_len <= 12: 
+            min_duration = 0.7 
+        elif text_len <= 22: 
+            min_duration = 1.0 
+        else: 
+            min_duration = 1.3
 
         for i, s in enumerate(processed_data):
             next_start = processed_data[i+1]["start"] if i < len(processed_data) - 1 else float('inf')
