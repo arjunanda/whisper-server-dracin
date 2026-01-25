@@ -349,16 +349,14 @@ def is_valid_segment(s) -> bool:
     if not text: 
         return False
     
-    if len(text) < 2 and not HAN_RE.search(text):
-        return False
-    
-    # STRICTER thresholds to reduce hallucinations
-   if s.no_speech_prob > 0.92:
+    if not HAN_RE.search(text):
         return False
 
+    # STRICTER thresholds to reduce hallucinations
+    if s.no_speech_prob > 0.92:
+        return False
     if s.avg_logprob < -1.4:
         return False
-
     if (s.end - s.start) < 0.2:
         return False
     return True
